@@ -69,8 +69,8 @@ func (w *pvcAutoresizer) Start(ctx context.Context) error {
 	}
 }
 
-func isTargetPVC(pvc *corev1.PersistentVolumeClaim) (bool, error) {
-	quantity, err := pvcStorageLimit(pvc)
+func isTargetPVC(pvc *corev1.PersistentVolumeClaim, sc *storagev1.StorageClass) (bool, error) {
+	quantity, err := pvcStorageLimit(pvc, sc)
 	if err != nil {
 		return false, fmt.Errorf("invalid storage limit: %w", err)
 	}
@@ -118,7 +118,7 @@ func (w *pvcAutoresizer) reconcile(ctx context.Context) error {
 			return nil
 		}
 		for _, pvc := range pvcs.Items {
-			isTarget, err := isTargetPVC(&pvc)
+			isTarget, err := isTargetPVC(&pvc, &sc)
 			if err != nil {
 				metrics.ResizerFailedResizeTotal.Increment()
 				w.log.WithValues("namespace", pvc.Namespace, "name", pvc.Name).Error(err, "failed to check target PVC")
@@ -133,7 +133,7 @@ func (w *pvcAutoresizer) reconcile(ctx context.Context) error {
 			if _, ok := vsMap[namespacedName]; !ok {
 				continue
 			}
-			err = w.resize(ctx, &pvc, vsMap[namespacedName])
+			err = w.resize(ctx, &pvc, vsMap[namespacedName], &sc)
 			if err != nil {
 				metrics.ResizerFailedResizeTotal.Increment()
 				w.log.WithValues("namespace", pvc.Namespace, "name", pvc.Name).Error(err, "failed to resize PVC")
@@ -144,10 +144,16 @@ func (w *pvcAutoresizer) reconcile(ctx context.Context) error {
 	return nil
 }
 
-func (w *pvcAutoresizer) resize(ctx context.Context, pvc *corev1.PersistentVolumeClaim, vs *VolumeStats) error {
+func (w *pvcAutoresizer) resize(ctx context.Context, pvc *corev1.PersistentVolumeClaim, vs *VolumeStats, sc *storagev1.StorageClass) error {
 	log := w.log.WithName("resize").WithValues("namespace", pvc.Namespace, "name", pvc.Name)
 
-	threshold, err := convertSizeInBytes(pvc.Annotations[ResizeThresholdAnnotation], vs.CapacityBytes, DefaultThreshold)
+	var resizeThreshold string
+	if annotation, ok := sc.Annotations[ResizeThresholdAnnotation]; ok && annotation != "" {
+		resizeThreshold = annotation
+	} else {
+		resizeThreshold = pvc.Annotations[ResizeThresholdAnnotation]
+	}
+	threshold, err := convertSizeInBytes(resizeThreshold, vs.CapacityBytes, DefaultThreshold)
 	if err != nil {
 		log.V(logLevelWarn).Info("failed to convert threshold annotation", "error", err.Error())
 		// lint:ignore nilerr ignores this because invalid annotations should be allowed.
@@ -162,7 +168,13 @@ func (w *pvcAutoresizer) resize(ctx context.Context, pvc *corev1.PersistentVolum
 	}
 
 	curReq := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
-	increase, err := convertSizeInBytes(pvc.Annotations[ResizeIncreaseAnnotation], curReq.Value(), DefaultIncrease)
+	var resizeIncrease string
+	if annotation, ok := sc.Annotations[ResizeIncreaseAnnotation]; ok && annotation != "" {
+		resizeIncrease = annotation
+	} else {
+		resizeIncrease = pvc.Annotations[ResizeIncreaseAnnotation]
+	}
+	increase, err := convertSizeInBytes(resizeIncrease, curReq.Value(), DefaultIncrease)
 	if err != nil {
 		log.V(logLevelWarn).Info("failed to convert increase annotation", "error", err.Error())
 		// lint:ignore nilerr ignores this because invalid annotations should be allowed.
@@ -182,7 +194,7 @@ func (w *pvcAutoresizer) resize(ctx context.Context, pvc *corev1.PersistentVolum
 			return nil
 		}
 	}
-	limitRes, err := pvcStorageLimit(pvc)
+	limitRes, err := pvcStorageLimit(pvc, sc)
 	if err != nil {
 		log.Error(err, "fetching storage limit failed")
 		return err
@@ -304,9 +316,11 @@ func calcSize(valStr string, capacity int64) (int64, error) {
 	return res, nil
 }
 
-func pvcStorageLimit(pvc *corev1.PersistentVolumeClaim) (resource.Quantity, error) {
+func pvcStorageLimit(pvc *corev1.PersistentVolumeClaim, sc *storagev1.StorageClass) (resource.Quantity, error) {
 	// storage limit on the annotation has precedence
-	if annotation, ok := pvc.Annotations[StorageLimitAnnotation]; ok && annotation != "" {
+	if annotation, ok := sc.Annotations[StorageLimitAnnotation]; ok && annotation != "" {
+		return resource.ParseQuantity(annotation)
+	} else if annotation, ok := pvc.Annotations[StorageLimitAnnotation]; ok && annotation != "" {
 		return resource.ParseQuantity(annotation)
 	}
 
