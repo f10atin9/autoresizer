@@ -69,6 +69,14 @@ func subMain() error {
 		return err
 	}
 
+	deployRestart := runners.NewRestarter(mgr.GetClient(),
+		ctrl.Log.WithName("deploy-restart"),
+		config.watchInterval, mgr.GetEventRecorderFor("deploy-restart"))
+	if err := mgr.Add(deployRestart); err != nil {
+		setupLog.Error(err, "unable to add deployRestart to manager")
+		return err
+	}
+
 	// +kubebuilder:scaffold:builder
 
 	setupLog.Info("starting manager")

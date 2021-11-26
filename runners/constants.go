@@ -18,6 +18,18 @@ const StorageLimitAnnotation = "resize.topolvm.io/storage_limit"
 // PreviousCapacityBytesAnnotation is the key of previous volume capacity.
 const PreviousCapacityBytesAnnotation = "resize.topolvm.io/pre_capacity_bytes"
 
+// AutoResizeEnabledKey is the key of flag that enables pods-autorestart.
+const AutoRestartEnabledKey = "restart.topolvm.io/enabled"
+
+// SupportOnlineResize
+const SupportOnlineResize = "online_resize/support"
+
+const RestartStopTime = "restart/stop_time"
+
+const RestartMaxTime = "restart/max_time"
+
+const ExpectReplicaNums = "restart/replica_nums"
+
 // DefaultThreshold is the default value of ResizeThresholdAnnotation.
 const DefaultThreshold = "10%"
 
