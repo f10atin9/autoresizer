@@ -19,14 +19,18 @@ const StorageLimitAnnotation = "resize.topolvm.io/storage_limit"
 const PreviousCapacityBytesAnnotation = "resize.topolvm.io/pre_capacity_bytes"
 
 // AutoResizeEnabledKey is the key of flag that enables pods-autorestart.
-const AutoRestartEnabledKey = "restart.topolvm.io/enabled"
+const AutoRestartEnabledKey = "restart/enabled"
 
 // SupportOnlineResize
-const SupportOnlineResize = "online_resize/support"
+const SupportOnlineResize = "restart/online_resize_support"
+
+const RestartStage = "restart/stage"
+
+const RestartSkip = "restart/skip"
 
 const RestartStopTime = "restart/stop_time"
 
-const RestartMaxTime = "restart/max_time"
+const ResizingMaxTime = "restart/max_time"
 
 const ExpectReplicaNums = "restart/replica_nums"
 

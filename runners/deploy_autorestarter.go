@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"github.com/go-logr/logr"
-	deployV1 "k8s.io/api/apps/v1"
+	"github.com/prometheus/common/log"
+	appsV1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -56,20 +58,59 @@ func (c *restarter) reconcile(ctx context.Context) error {
 	if stopPvcErr != nil {
 		return stopPvcErr
 	}
-	for _, pvc := range stopPvcs {
-		//deploy, err := c.getDeploy(ctx, &pvc)
-		//if deploy.Spec.Replicas == 0 &&
-		err := c.stopDeploy(ctx, &pvc)
+
+	stopDeploy, stopSts, timeoutDeploy, timeoutSts, stopAppErr := c.getAppList(ctx, stopPvcs)
+	if stopAppErr != nil {
+		return stopAppErr
+	}
+	//stop deploy/sts
+	for _, deploy := range stopDeploy {
+		err := c.stopDeploy(ctx, deploy)
 		if err != nil {
 			return err
 		}
 	}
-	startPvc, err := c.getPVCListByConditionsType(ctx, v1.PersistentVolumeClaimFileSystemResizePending)
-	if err != nil {
-		return err
+	for _, sts := range stopSts {
+		err := c.stopSts(ctx, sts)
+		if err != nil {
+			return err
+		}
 	}
+
+	//get pvc need restart
+	startPvc, err := c.getPVCListByConditionsType(ctx, v1.PersistentVolumeClaimFileSystemResizePending)
+
+	//get list
+	startDeploy := make([]*appsV1.Deployment, 0)
+	startSts := make([]*appsV1.StatefulSet, 0)
 	for _, pvc := range startPvc {
-		err := c.StartDeploy(ctx, &pvc)
+		dep, err := c.getDeploy(ctx, &pvc)
+		if err != nil {
+			return err
+		}
+		if dep != nil {
+			stopDeploy = append(startDeploy, dep)
+			continue
+		}
+		sts, err := c.getSts(ctx, &pvc)
+		if err != nil {
+			return err
+		}
+		if sts != nil {
+			startSts = append(startSts, sts)
+		}
+	}
+	startDeploy = append(stopDeploy, timeoutDeploy...)
+	startSts = append(startSts, timeoutSts...)
+	//restart
+	for _, deploy := range startDeploy {
+		err := c.StartDeploy(ctx, deploy)
+		if err != nil {
+			return err
+		}
+	}
+	for _, sts := range startSts {
+		err := c.StartSts(ctx, sts)
 		if err != nil {
 			return err
 		}
@@ -130,32 +171,83 @@ func (c *restarter) getSc(ctx context.Context) (map[string]string, error) {
 	return scMap, nil
 }
 
-func (c *restarter) stopDeploy(ctx context.Context, pvc *v1.PersistentVolumeClaim) error {
+func (c *restarter) stopDeploy(ctx context.Context, deploy *appsV1.Deployment) error {
 	var zero int32
 	zero = 0
-	deploy, getDeployErr := c.getDeploy(ctx, pvc)
-	replicas := *deploy.Spec.Replicas
-	if getDeployErr != nil {
-		return getDeployErr
+	if val, ok := deploy.Annotations[RestartSkip]; ok {
+		skip, err := strconv.ParseBool(val)
+		if err != nil {
+			return err
+		}
+		if skip {
+			return nil
+		}
 	}
+	if stage, ok := deploy.Annotations[RestartStage]; ok {
+		if stage == "resizing" {
+			return nil
+		}
+	}
+	replicas := *deploy.Spec.Replicas
 	updateDeploy := deploy.DeepCopy()
 
 	// add annotations
 	updateDeploy.Annotations[RestartStopTime] = strconv.FormatInt(time.Now().Unix(), 10)
+	fmt.Println("add stop time ", strconv.FormatInt(time.Now().Unix(), 10))
 	updateDeploy.Annotations[ExpectReplicaNums] = strconv.Itoa(int(replicas))
-
+	fmt.Println("add expect replica nums :", strconv.Itoa(int(replicas)))
+	updateDeploy.Annotations[RestartStage] = "resizing"
 	updateDeploy.Spec.Replicas = &zero
 	var opts []client.UpdateOption
+	log.Info("stop deployment:" + deploy.Name)
 	updateErr := c.client.Update(ctx, updateDeploy, opts...)
 	return updateErr
 }
 
-func (c *restarter) StartDeploy(ctx context.Context, pvc *v1.PersistentVolumeClaim) error {
-	deploy, err := c.getDeploy(ctx, pvc)
-	if err != nil {
-		return err
+func (c *restarter) stopSts(ctx context.Context, sts *appsV1.StatefulSet) error {
+	var zero int32
+	zero = 0
+	if val, ok := sts.Annotations[RestartSkip]; ok {
+		skip, err := strconv.ParseBool(val)
+		if err != nil {
+			return err
+		}
+		if skip {
+			return nil
+		}
+	}
+	if stage, ok := sts.Annotations[RestartStage]; ok {
+		if stage == "resizing" {
+			return nil
+		}
+	}
+	replicas := *sts.Spec.Replicas
+	updateSts := sts.DeepCopy()
+
+	// add annotations
+	updateSts.Annotations[RestartStopTime] = strconv.FormatInt(time.Now().Unix(), 10)
+	fmt.Println("add stop time ", strconv.FormatInt(time.Now().Unix(), 10))
+	updateSts.Annotations[ExpectReplicaNums] = strconv.Itoa(int(replicas))
+	fmt.Println("add expect replica nums :", strconv.Itoa(int(replicas)))
+	updateSts.Annotations[RestartStage] = "resizing"
+	updateSts.Spec.Replicas = &zero
+	var opts []client.UpdateOption
+	log.Info("stop deployment:" + sts.Name)
+	updateErr := c.client.Update(ctx, updateSts, opts...)
+	return updateErr
+}
+
+func (c *restarter) StartDeploy(ctx context.Context, deploy *appsV1.Deployment) error {
+	if _, ok := deploy.Annotations[RestartStage]; !ok {
+		return nil
+	}
+	if deploy.Annotations[RestartStage] != "resizing" {
+		return fmt.Errorf("Unknown stage, skip ")
 	}
 	updateDeploy := deploy.DeepCopy()
+	if _, ok := deploy.Annotations[ExpectReplicaNums]; !ok {
+		return fmt.Errorf("Cannot find replica numbers before stop ")
+	}
 	expectReplicaNums, err := strconv.Atoi(deploy.Annotations[ExpectReplicaNums])
 	if err != nil {
 		return err
@@ -163,19 +255,49 @@ func (c *restarter) StartDeploy(ctx context.Context, pvc *v1.PersistentVolumeCla
 	replicas := int32(expectReplicaNums)
 	delete(updateDeploy.Annotations, RestartStopTime)
 	delete(updateDeploy.Annotations, ExpectReplicaNums)
+	delete(updateDeploy.Annotations, RestartStage)
 	updateDeploy.Spec.Replicas = &replicas
 	var opts []client.UpdateOption
+	log.Info("start deployment: " + deploy.Name)
 	err = c.client.Update(ctx, updateDeploy, opts...)
 	return err
 }
 
-func (c *restarter) getDeploy(ctx context.Context, pvc *v1.PersistentVolumeClaim) (*deployV1.Deployment, error) {
-	deployList := &deployV1.DeploymentList{}
+func (c *restarter) StartSts(ctx context.Context, sts *appsV1.StatefulSet) error {
+	if _, ok := sts.Annotations[RestartStage]; !ok {
+		return nil
+	}
+	if sts.Annotations[RestartStage] != "resizing" {
+		return fmt.Errorf("Unknown stage, skip ")
+	}
+	updateSts := sts.DeepCopy()
+	if _, ok := sts.Annotations[ExpectReplicaNums]; !ok {
+		return fmt.Errorf("Cannot find replica numbers before stop ")
+	}
+	expectReplicaNums, err := strconv.Atoi(sts.Annotations[ExpectReplicaNums])
+	if err != nil {
+		return err
+	}
+	replicas := int32(expectReplicaNums)
+	delete(updateSts.Annotations, RestartStopTime)
+	delete(updateSts.Annotations, ExpectReplicaNums)
+	delete(updateSts.Annotations, RestartStage)
+	updateSts.Spec.Replicas = &replicas
+	var opts []client.UpdateOption
+	log.Info("start deployment: " + sts.Name)
+	err = c.client.Update(ctx, updateSts, opts...)
+	return err
+}
+
+func (c *restarter) getDeploy(ctx context.Context, pvc *v1.PersistentVolumeClaim) (*appsV1.Deployment, error) {
+	// get deploy list
+	deployList := &appsV1.DeploymentList{}
 	var opts []client.ListOption
 	err := c.client.List(ctx, deployList, opts...)
 	if err != nil {
 		return nil, err
 	}
+
 	for _, deploy := range deployList.Items {
 		if len(deploy.Spec.Template.Spec.Volumes) > 0 {
 			for _, vol := range deploy.Spec.Template.Spec.Volumes {
@@ -185,5 +307,95 @@ func (c *restarter) getDeploy(ctx context.Context, pvc *v1.PersistentVolumeClaim
 			}
 		}
 	}
-	return nil, fmt.Errorf("Cannot get deployment which pod mounted the pvc %s ", pvc.Name)
+	return nil, nil
+}
+
+func (c *restarter) getSts(ctx context.Context, targetPvc *v1.PersistentVolumeClaim) (*appsV1.StatefulSet, error) {
+	//get all sts
+	stsList := &appsV1.StatefulSetList{}
+	var opts []client.ListOption
+	err := c.client.List(ctx, stsList, opts...)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, sts := range stsList.Items {
+		if len(sts.Spec.Template.Spec.Volumes) > 0 {
+			for _, vol := range sts.Spec.Template.Spec.Volumes {
+				if vol.PersistentVolumeClaim != nil && vol.PersistentVolumeClaim.ClaimName == targetPvc.Name {
+					return &sts, nil
+				}
+			}
+		}
+		for _, pvc := range sts.Spec.VolumeClaimTemplates {
+			if pvc.Name == targetPvc.Name {
+				return &sts, nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("Cannot get deployment or statefulSet which pod mounted the pvc %s ", targetPvc.Name)
+}
+
+func (c *restarter) IfDeployTimeout(ctx context.Context, scName string, deploy *appsV1.Deployment) bool {
+	sc := &storagev1.StorageClass{}
+	err := c.client.Get(ctx, types.NamespacedName{Namespace: "", Name: scName}, sc)
+	maxTime := 300
+	if val, ok := sc.Annotations[ResizingMaxTime]; ok {
+		userSetTime, err := strconv.Atoi(val)
+		if err == nil {
+			maxTime = userSetTime
+		}
+	}
+	startResizeTime, err := strconv.Atoi(deploy.Annotations[RestartStopTime])
+	if err != nil {
+		return true
+	}
+	return int(time.Now().Unix())-startResizeTime > maxTime
+}
+
+func (c *restarter) IfStsTimeout(ctx context.Context, scName string, sts *appsV1.StatefulSet) bool {
+	sc := &storagev1.StorageClass{}
+	err := c.client.Get(ctx, types.NamespacedName{Namespace: "", Name: scName}, sc)
+	maxTime := 300
+	if val, ok := sc.Annotations[ResizingMaxTime]; ok {
+		userSetTime, err := strconv.Atoi(val)
+		if err == nil {
+			maxTime = userSetTime
+		}
+	}
+	startResizeTime, err := strconv.Atoi(sts.Annotations[RestartStopTime])
+	if err != nil {
+		return true
+	}
+	return int(time.Now().Unix())-startResizeTime > maxTime
+}
+
+func (c *restarter) getAppList(ctx context.Context, pvcs []v1.PersistentVolumeClaim) (deployToStop []*appsV1.Deployment, stsToStop []*appsV1.StatefulSet, deployTimeout []*appsV1.Deployment, stsTimeout []*appsV1.StatefulSet, err error) {
+	for _, pvc := range pvcs {
+		dep, err := c.getDeploy(ctx, &pvc)
+		if err != nil {
+			return
+		}
+		if dep != nil {
+			if timeout := c.IfDeployTimeout(ctx, *pvc.Spec.StorageClassName, dep); timeout {
+				deployTimeout = append(deployTimeout, dep)
+			} else {
+				deployToStop = append(deployToStop, dep)
+			}
+			continue
+		}
+		sts, stsErr := c.getSts(ctx, &pvc)
+		if stsErr != nil {
+			return
+		}
+		if sts != nil {
+			if timeout := c.IfStsTimeout(ctx, *pvc.Spec.StorageClassName, sts); timeout {
+				stsTimeout = append(stsTimeout, sts)
+			} else {
+				stsToStop = append(stsToStop, sts)
+			}
+		}
+	}
+	return
 }
