@@ -375,7 +375,7 @@ func (c *restarter) getAppList(ctx context.Context, pvcs []v1.PersistentVolumeCl
 	for _, pvc := range pvcs {
 		dep, err := c.getDeploy(ctx, &pvc)
 		if err != nil {
-			return
+			return deployToStop, stsToStop, deployTimeout, stsTimeout, err
 		}
 		if dep != nil {
 			if timeout := c.IfDeployTimeout(ctx, *pvc.Spec.StorageClassName, dep); timeout {
@@ -387,7 +387,7 @@ func (c *restarter) getAppList(ctx context.Context, pvcs []v1.PersistentVolumeCl
 		}
 		sts, stsErr := c.getSts(ctx, &pvc)
 		if stsErr != nil {
-			return
+			return deployToStop, stsToStop, deployTimeout, stsTimeout, err
 		}
 		if sts != nil {
 			if timeout := c.IfStsTimeout(ctx, *pvc.Spec.StorageClassName, sts); timeout {
