@@ -65,12 +65,14 @@ func (c *restarter) reconcile(ctx context.Context) error {
 	}
 	//stop deploy/sts
 	for _, deploy := range stopDeploy {
+		log.Info("Stopping deploy: ", deploy.Name)
 		err := c.stopDeploy(ctx, deploy)
 		if err != nil {
 			return err
 		}
 	}
 	for _, sts := range stopSts {
+		log.Info("Stopping StatefulSet: ", sts.Name)
 		err := c.stopSts(ctx, sts)
 		if err != nil {
 			return err
@@ -89,7 +91,7 @@ func (c *restarter) reconcile(ctx context.Context) error {
 			return err
 		}
 		if dep != nil {
-			stopDeploy = append(startDeploy, dep)
+			startDeploy = append(startDeploy, dep)
 			continue
 		}
 		sts, err := c.getSts(ctx, &pvc)
@@ -100,17 +102,28 @@ func (c *restarter) reconcile(ctx context.Context) error {
 			startSts = append(startSts, sts)
 		}
 	}
-	startDeploy = append(stopDeploy, timeoutDeploy...)
-	startSts = append(startSts, timeoutSts...)
+
 	//restart
 	for _, deploy := range startDeploy {
-		err := c.StartDeploy(ctx, deploy)
+		err := c.StartDeploy(ctx, deploy, false)
+		if err != nil {
+			return err
+		}
+	}
+	for _, deploy := range timeoutDeploy {
+		err := c.StartDeploy(ctx, deploy, true)
 		if err != nil {
 			return err
 		}
 	}
 	for _, sts := range startSts {
-		err := c.StartSts(ctx, sts)
+		err := c.StartSts(ctx, sts, false)
+		if err != nil {
+			return err
+		}
+	}
+	for _, sts := range timeoutSts {
+		err := c.StartSts(ctx, sts, true)
 		if err != nil {
 			return err
 		}
@@ -175,11 +188,9 @@ func (c *restarter) stopDeploy(ctx context.Context, deploy *appsV1.Deployment) e
 	var zero int32
 	zero = 0
 	if val, ok := deploy.Annotations[RestartSkip]; ok {
-		skip, err := strconv.ParseBool(val)
-		if err != nil {
-			return err
-		}
+		skip, _ := strconv.ParseBool(val)
 		if skip {
+			log.Info("Skip restart deploy ", deploy.Name)
 			return nil
 		}
 	}
@@ -193,9 +204,7 @@ func (c *restarter) stopDeploy(ctx context.Context, deploy *appsV1.Deployment) e
 
 	// add annotations
 	updateDeploy.Annotations[RestartStopTime] = strconv.FormatInt(time.Now().Unix(), 10)
-	fmt.Println("add stop time ", strconv.FormatInt(time.Now().Unix(), 10))
 	updateDeploy.Annotations[ExpectReplicaNums] = strconv.Itoa(int(replicas))
-	fmt.Println("add expect replica nums :", strconv.Itoa(int(replicas)))
 	updateDeploy.Annotations[RestartStage] = "resizing"
 	updateDeploy.Spec.Replicas = &zero
 	var opts []client.UpdateOption
@@ -226,9 +235,7 @@ func (c *restarter) stopSts(ctx context.Context, sts *appsV1.StatefulSet) error 
 
 	// add annotations
 	updateSts.Annotations[RestartStopTime] = strconv.FormatInt(time.Now().Unix(), 10)
-	fmt.Println("add stop time ", strconv.FormatInt(time.Now().Unix(), 10))
 	updateSts.Annotations[ExpectReplicaNums] = strconv.Itoa(int(replicas))
-	fmt.Println("add expect replica nums :", strconv.Itoa(int(replicas)))
 	updateSts.Annotations[RestartStage] = "resizing"
 	updateSts.Spec.Replicas = &zero
 	var opts []client.UpdateOption
@@ -237,7 +244,7 @@ func (c *restarter) stopSts(ctx context.Context, sts *appsV1.StatefulSet) error 
 	return updateErr
 }
 
-func (c *restarter) StartDeploy(ctx context.Context, deploy *appsV1.Deployment) error {
+func (c *restarter) StartDeploy(ctx context.Context, deploy *appsV1.Deployment, timeout bool) error {
 	if _, ok := deploy.Annotations[RestartStage]; !ok {
 		return nil
 	}
@@ -253,6 +260,9 @@ func (c *restarter) StartDeploy(ctx context.Context, deploy *appsV1.Deployment) 
 		return err
 	}
 	replicas := int32(expectReplicaNums)
+	if timeout {
+		updateDeploy.Annotations[RestartSkip] = "true"
+	}
 	delete(updateDeploy.Annotations, RestartStopTime)
 	delete(updateDeploy.Annotations, ExpectReplicaNums)
 	delete(updateDeploy.Annotations, RestartStage)
@@ -263,7 +273,7 @@ func (c *restarter) StartDeploy(ctx context.Context, deploy *appsV1.Deployment) 
 	return err
 }
 
-func (c *restarter) StartSts(ctx context.Context, sts *appsV1.StatefulSet) error {
+func (c *restarter) StartSts(ctx context.Context, sts *appsV1.StatefulSet, timeout bool) error {
 	if _, ok := sts.Annotations[RestartStage]; !ok {
 		return nil
 	}
@@ -279,6 +289,9 @@ func (c *restarter) StartSts(ctx context.Context, sts *appsV1.StatefulSet) error
 		return err
 	}
 	replicas := int32(expectReplicaNums)
+	if timeout {
+		updateSts.Annotations[RestartSkip] = "true"
+	}
 	delete(updateSts.Annotations, RestartStopTime)
 	delete(updateSts.Annotations, ExpectReplicaNums)
 	delete(updateSts.Annotations, RestartStage)
@@ -347,11 +360,15 @@ func (c *restarter) IfDeployTimeout(ctx context.Context, scName string, deploy *
 			maxTime = userSetTime
 		}
 	}
+	if _, ok := deploy.Annotations[RestartStopTime]; !ok {
+		return false
+	}
 	startResizeTime, err := strconv.Atoi(deploy.Annotations[RestartStopTime])
 	if err != nil {
 		return true
 	}
-	return int(time.Now().Unix())-startResizeTime > maxTime
+	timeout := int(time.Now().Unix())-startResizeTime > maxTime
+	return timeout
 }
 
 func (c *restarter) IfStsTimeout(ctx context.Context, scName string, sts *appsV1.StatefulSet) bool {
@@ -364,11 +381,15 @@ func (c *restarter) IfStsTimeout(ctx context.Context, scName string, sts *appsV1
 			maxTime = userSetTime
 		}
 	}
+	if _, ok := sts.Annotations[RestartStopTime]; !ok {
+		return false
+	}
 	startResizeTime, err := strconv.Atoi(sts.Annotations[RestartStopTime])
 	if err != nil {
 		return true
 	}
-	return int(time.Now().Unix())-startResizeTime > maxTime
+	timeout := int(time.Now().Unix())-startResizeTime > maxTime
+	return timeout
 }
 
 func (c *restarter) getAppList(ctx context.Context, pvcs []v1.PersistentVolumeClaim) (deployToStop []*appsV1.Deployment, stsToStop []*appsV1.StatefulSet, deployTimeout []*appsV1.Deployment, stsTimeout []*appsV1.StatefulSet, err error) {
